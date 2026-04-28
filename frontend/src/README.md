@@ -1,0 +1,1 @@
+Frontend entry: open src/App.jsx. Run `npm install` then `npm run dev`.

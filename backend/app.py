@@ -1,17 +1,18 @@
 # ═══════════════════════════════════════════════════════════════════
-#  SG Jewels · app.py  v5
-#  Key fix: robust pair detection with vertical-split strategy
-#  Works for product photos (white bg, earrings side-by-side)
+#  SG Jewels · app.py  v7
+#  NEW: necklace processing — BG removal + chain-end crop
+#  ENHANCED: earring design highlight via contrast boost on export
 # ═══════════════════════════════════════════════════════════════════
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageEnhance
 import io
 import traceback
+from typing import Optional
 
 try:
     from rembg import remove as _rembg
@@ -20,8 +21,6 @@ try:
 except ImportError:
     REMBG_AVAILABLE = False
     print("[SG Jewels] ⚠️  rembg not found — pip install rembg onnxruntime")
-
-U2NET_AVAILABLE = False
 
 app = FastAPI()
 app.add_middleware(
@@ -33,18 +32,14 @@ app.add_middleware(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  BG REMOVAL
+#  BACKGROUND REMOVAL (shared)
 # ═══════════════════════════════════════════════════════════════════
-
-def _u2net_remove(pil_rgb: Image.Image):
-    return None   # plug in your U2Net here
-
 
 def _rembg_remove(pil_rgb: Image.Image):
     if not REMBG_AVAILABLE:
         return None
     try:
-        out = _rembg(pil_rgb)
+        out  = _rembg(pil_rgb)
         rgba = np.array(out.convert("RGBA"))
         if rgba[:, :, 3].min() >= 254:
             return None
@@ -55,42 +50,67 @@ def _rembg_remove(pil_rgb: Image.Image):
 
 
 def _grabcut_remove(pil_rgb: Image.Image) -> np.ndarray:
-    orig_w, orig_h = pil_rgb.size
-    MAX_DIM = 600
-    scale   = min(MAX_DIM / orig_w, MAX_DIM / orig_h, 1.0)
-    w, h    = max(int(orig_w * scale), 100), max(int(orig_h * scale), 100)
-    img     = np.array(pil_rgb.resize((w, h), Image.LANCZOS).convert("RGB"))
-    mask    = np.zeros((h, w), np.uint8)
-    bgM, fgM = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
-    pad  = max(int(min(h, w) * 0.07), 8)
-    rect = (pad, pad, w - 2 * pad, h - 2 * pad)
+    ow, oh = pil_rgb.size
+    s = min(600/ow, 600/oh, 1.0)
+    w, h = max(int(ow*s), 100), max(int(oh*s), 100)
+    img  = np.array(pil_rgb.resize((w, h), Image.LANCZOS).convert("RGB"))
+    msk  = np.zeros((h, w), np.uint8)
+    bg, fg = np.zeros((1,65), np.float64), np.zeros((1,65), np.float64)
+    pad  = max(int(min(h,w)*0.07), 8)
     try:
-        cv2.grabCut(img, mask, rect, bgM, fgM, 12, cv2.GC_INIT_WITH_RECT)
-        a = np.where((mask == 2) | (mask == 0), 0, 255).astype(np.uint8)
+        cv2.grabCut(img, msk, (pad,pad,w-2*pad,h-2*pad), bg, fg, 12, cv2.GC_INIT_WITH_RECT)
+        a = np.where((msk==2)|(msk==0), 0, 255).astype(np.uint8)
     except Exception:
-        a = np.full((h, w), 255, dtype=np.uint8)
-    k5 = np.ones((5, 5), np.uint8)
-    a  = cv2.morphologyEx(a, cv2.MORPH_CLOSE, k5)
-    a  = cv2.morphologyEx(a, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
-    af = cv2.GaussianBlur(a.astype(np.float32) / 255.0, (7, 7), 2)
-    a  = (af * 255).clip(0, 255).astype(np.uint8)
-    if scale < 1.0:
-        a = cv2.resize(a, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-    rgba         = np.array(pil_rgb.convert("RGBA"))
-    rgba[:, :, 3] = a
+        a = np.full((h,w), 255, dtype=np.uint8)
+    a = cv2.morphologyEx(a, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+    a = cv2.morphologyEx(a, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8))
+    af = cv2.GaussianBlur(a.astype(np.float32)/255.0, (7,7), 2)
+    a  = (af*255).clip(0,255).astype(np.uint8)
+    if s < 1.0:
+        a = cv2.resize(a, (ow,oh), interpolation=cv2.INTER_LINEAR)
+    rgba = np.array(pil_rgb.convert("RGBA"))
+    rgba[:,:,3] = a
     return rgba
 
 
 def remove_background(pil_rgb: Image.Image) -> np.ndarray:
-    for fn in [_u2net_remove, _rembg_remove]:
-        r = fn(pil_rgb)
-        if r is not None:
-            return r
+    r = _rembg_remove(pil_rgb)
+    if r is not None:
+        return r
     return _grabcut_remove(pil_rgb)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  SMART PAIR DETECTION — main logic
+#  ENHANCEMENT — contrast + brightness boost for display clarity
+#  Applied AFTER BG removal so the jewellery design pops on screen
+# ═══════════════════════════════════════════════════════════════════
+
+def enhance_jewellery(rgba: np.ndarray) -> np.ndarray:
+    """
+    Boost contrast and saturation of the jewellery design.
+    This is what makes gold designs look vivid instead of dull.
+    Only RGB channels are enhanced; alpha channel is preserved.
+    """
+    pil = Image.fromarray(rgba.astype(np.uint8), "RGBA")
+    r, g, b, a = pil.split()
+    rgb = Image.merge("RGB", (r, g, b))
+
+    # Contrast boost — makes design details sharper and more visible
+    rgb = ImageEnhance.Contrast(rgb).enhance(1.35)
+    # Brightness slight lift — earrings look lit from ambient light
+    rgb = ImageEnhance.Brightness(rgb).enhance(1.12)
+    # Colour saturation — gold tones pop more
+    rgb = ImageEnhance.Color(rgb).enhance(1.30)
+    # Sharpness — fine filigree details become crisper
+    rgb = ImageEnhance.Sharpness(rgb).enhance(2.0)
+
+    r2, g2, b2 = rgb.split()
+    enhanced = Image.merge("RGBA", (r2, g2, b2, a))
+    return np.array(enhanced)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  EARRING EXTRACTION (unchanged from v6)
 # ═══════════════════════════════════════════════════════════════════
 
 class JewelleryError(Exception):
@@ -99,232 +119,177 @@ class JewelleryError(Exception):
 
 def _clean_mask(alpha: np.ndarray) -> np.ndarray:
     _, b = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
-    k = np.ones((7, 7), np.uint8)
+    k = np.ones((7,7), np.uint8)
     b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, k)
-    b = cv2.morphologyEx(b, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+    b = cv2.morphologyEx(b, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8))
     return b
 
 
-def _good_contours(binary: np.ndarray, img_area: int):
+def _good_contours(binary, img_area):
     cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_px   = max(100, img_area * 0.001)
-    cnts     = [c for c in cnts if cv2.contourArea(c) > min_px]
+    t = max(80, img_area * 0.0008)
+    cnts = [c for c in cnts if cv2.contourArea(c) > t]
     cnts.sort(key=cv2.contourArea, reverse=True)
     return cnts
 
 
-def _tight_crop(rgba: np.ndarray, pad: int = 14) -> np.ndarray:
-    """Crop to tight bounding box of non-transparent pixels."""
-    alpha = rgba[:, :, 3]
-    rows  = np.any(alpha > 20, axis=1)
-    cols  = np.any(alpha > 20, axis=0)
-    if not rows.any() or not cols.any():
-        return rgba
-    H, W  = rgba.shape[:2]
-    r1, r2 = np.where(rows)[0][[0, -1]]
-    c1, c2 = np.where(cols)[0][[0, -1]]
-    return rgba[max(0, r1-pad):min(H, r2+pad), max(0, c1-pad):min(W, c2+pad)]
+def _tight_crop(rgba: np.ndarray, pad=12) -> np.ndarray:
+    a = rgba[:,:,3]
+    rows = np.any(a > 15, axis=1); cols = np.any(a > 15, axis=0)
+    if not rows.any() or not cols.any(): return rgba
+    H, W = rgba.shape[:2]
+    r1,r2 = np.where(rows)[0][[0,-1]]; c1,c2 = np.where(cols)[0][[0,-1]]
+    return rgba[max(0,r1-pad):min(H,r2+pad), max(0,c1-pad):min(W,c2+pad)]
 
 
-def _crop_one_contour(rgba: np.ndarray, contour, pad: int = 14) -> np.ndarray:
-    """Return RGBA with only this contour visible, tightly cropped."""
-    H, W  = rgba.shape[:2]
-    x, y, cw, ch = cv2.boundingRect(contour)
-    x1, y1 = max(0, x - pad),      max(0, y - pad)
-    x2, y2 = min(W, x + cw + pad), min(H, y + ch + pad)
-
-    # Mask: keep ONLY this contour's pixels
-    solo = np.zeros((H, W), np.uint8)
-    cv2.drawContours(solo, [contour], -1, 255, cv2.FILLED)
-
-    out         = rgba.copy()
-    out[:, :, 3] = np.minimum(out[:, :, 3], solo)
+def _crop_one_contour(rgba, cnt, pad=14):
+    H, W = rgba.shape[:2]
+    x,y,cw,ch = cv2.boundingRect(cnt)
+    x1,y1 = max(0,x-pad), max(0,y-pad)
+    x2,y2 = min(W,x+cw+pad), min(H,y+ch+pad)
+    solo = np.zeros((H,W), np.uint8)
+    cv2.drawContours(solo, [cnt], -1, 255, cv2.FILLED)
+    out = rgba.copy(); out[:,:,3] = np.minimum(out[:,:,3], solo)
     return out[y1:y2, x1:x2]
 
 
-def _earring_score(c) -> float:
-    x, y, cw, ch = cv2.boundingRect(c)
-    aspect = ch / cw if cw > 0 else 1.0
-    return cv2.contourArea(c) * max(1.0, aspect)
+def _earring_score(c):
+    x,y,cw,ch = cv2.boundingRect(c)
+    return cv2.contourArea(c) * max(1.0, ch/cw if cw>0 else 1)
 
 
-# ─── STRATEGY 1: contour-based pair split ──────────────────────────────
-def _split_by_contours(rgba: np.ndarray):
-    """
-    If the alpha mask has TWO clearly separated blobs of similar size,
-    pick the better one (taller aspect = more earring-like).
-    Returns (cropped_rgba, 'pair') or None if not clearly two blobs.
-    """
-    H, W   = rgba.shape[:2]
-    binary = _clean_mask(rgba[:, :, 3])
-    cnts   = _good_contours(binary, H * W)
-
-    if len(cnts) < 2:
+def _find_alpha_split_col(alpha):
+    H, W = alpha.shape
+    lo, hi = int(W*0.25), int(W*0.75)
+    col_sums = alpha[:, lo:hi].sum(axis=0).astype(np.float32)
+    smooth   = np.convolve(col_sums, np.ones(7)/7, mode='same')
+    split_l  = int(np.argmin(smooth))
+    split_c  = lo + split_l
+    mn, mx   = smooth[split_l], smooth.max()
+    contrast = 1.0 - (mn/mx) if mx > 0 else 0
+    print(f"[alpha-split] col={split_c} contrast={contrast:.2f}")
+    if contrast < 0.15:
         return None
-
-    a0, a1  = cv2.contourArea(cnts[0]), cv2.contourArea(cnts[1])
-    size_ratio = a1 / a0 if a0 > 0 else 0
-
-    if size_ratio < 0.25:
-        # Very different sizes — not a symmetric pair
-        return None
-
-    # Check horizontal separation (pair = blobs on LEFT and RIGHT halves)
-    (x0, y0, w0, h0) = cv2.boundingRect(cnts[0])
-    (x1, y1, w1, h1) = cv2.boundingRect(cnts[1])
-    cx0 = x0 + w0 / 2
-    cx1 = x1 + w1 / 2
-
-    # Ensure they are NOT overlapping horizontally
-    overlap = (x0 < x1 + w1) and (x1 < x0 + w0)
-    if overlap and abs(cx0 - cx1) < W * 0.15:
-        # Too close horizontally — probably NOT a pair side-by-side
-        return None
-
-    print(f"[pair] contour split: blob0 cx={cx0:.0f}, blob1 cx={cx1:.0f}")
-    best = max(cnts[:2], key=_earring_score)
-    return _crop_one_contour(rgba, best), "pair"
+    return split_c
 
 
-# ─── STRATEGY 2: vertical centre split ─────────────────────────────────
-def _split_by_midline(pil_rgb: Image.Image) -> tuple:
-    """
-    For product photos where two earrings sit side-by-side on a white BG
-    and rembg/GrabCut merges them into one blob:
-
-    1. Find the vertical column with the LOWEST foreground density
-       in the centre 40% of the image — this is the gap between the earrings.
-    2. Crop the LEFT half (left earring).
-    3. Apply BG removal to just that half.
-    4. Return tight crop.
-    """
-    W, H   = pil_rgb.size
-
-    # Convert to grayscale and threshold to detect fg
-    gray  = np.array(pil_rgb.convert("L"))
-    # For white-background product images, fg = dark pixels
-    # For dark-background product images, fg = light pixels
-    # Auto-detect: if mean > 200 it's likely white BG
-    is_white_bg = gray.mean() > 160
-
-    if is_white_bg:
-        fg_mask = (gray < 220).astype(np.uint8) * 255
-    else:
-        fg_mask = (gray > 35).astype(np.uint8) * 255
-
-    # Search for split column in centre 30–70% of width
-    search_l = int(W * 0.30)
-    search_r = int(W * 0.70)
-
-    # Sum foreground pixels per column
-    col_sums = fg_mask[:, search_l:search_r].sum(axis=0)
-
-    # Find minimum density column = gap between earrings
-    split_col = search_l + int(np.argmin(col_sums))
-    print(f"[pair] midline split at x={split_col} (image W={W})")
-
-    # Ensure split is somewhat near centre (not edge artefact)
-    if split_col < W * 0.25 or split_col > W * 0.75:
-        split_col = W // 2
-        print(f"[pair] midline clamped to centre x={split_col}")
-
-    # Crop LEFT earring with 5% padding on split edge
-    pad   = max(int(W * 0.03), 8)
-    left  = pil_rgb.crop((0, 0, split_col + pad, H))
-
-    # BG removal on just the left half
-    rgba_half = remove_background(left)
-
-    # Tight crop to earring content only
-    cropped = _tight_crop(rgba_half)
-
-    if cropped.shape[0] < 20 or cropped.shape[1] < 20:
-        return None
-
-    print(f"[pair] midline half crop: {cropped.shape[1]}×{cropped.shape[0]}")
-    return cropped, "pair"
+def _extract_left_half(rgba, split_col):
+    H, W = rgba.shape[:2]
+    pad  = max(int(W*0.04), 10)
+    cut  = min(split_col + pad, W)
+    return _tight_crop(rgba[:, :cut].copy())
 
 
-# ─── STRATEGY 3: full-image fallback ───────────────────────────────────
-def _full_image_fallback(rgba: np.ndarray):
-    """Return tight crop of the full BG-removed image."""
-    cropped = _tight_crop(rgba)
-    if cropped.shape[0] < 20 or cropped.shape[1] < 20:
-        raise JewelleryError("No jewellery detected. Please use a clearer image.")
-    return cropped, "single"
-
-
-# ─── MASTER ANALYSER ────────────────────────────────────────────────────
-def analyze_jewellery(rgba: np.ndarray, pil_rgb: Image.Image):
-    """
-    Multi-strategy earring extraction:
-      1. Contour split  — works when BG removal cleanly separates the two earrings
-      2. Midline split  — works when they share a connected foreground blob (product photos)
-      3. Single object  — necklace check + return as-is
-      4. Full fallback  — always returns something useful
-    """
+def extract_earring(rgba: np.ndarray, pil_rgb: Image.Image):
     H, W  = rgba.shape[:2]
-    alpha = rgba[:, :, 3]
+    alpha = rgba[:,:,3]
+    if alpha.max() < 15:
+        raise JewelleryError("No jewellery detected. Please upload a clearer earring image.")
 
-    print(f"\n[analyze] image {W}×{H}, alpha min={alpha.min()} max={alpha.max()}")
+    # Try alpha-column split first
+    sc = _find_alpha_split_col(alpha)
+    if sc is not None:
+        left = _extract_left_half(rgba, sc)
+        if left.shape[0] > 20 and left.shape[1] > 20:
+            return left, "pair"
 
     binary = _clean_mask(alpha)
-    cnts   = _good_contours(binary, H * W)
-    print(f"[analyze] {len(cnts)} contours found")
+    cnts   = _good_contours(binary, H*W)
 
-    # ── Single clear blob ──────────────────────────────────────────
+    if not cnts:
+        cropped = _tight_crop(rgba)
+        if cropped.shape[0] > 20: return cropped, "single"
+        raise JewelleryError("No earring detected. Try a cleaner background.")
+
     if len(cnts) == 1:
-        x, y, cw, ch = cv2.boundingRect(cnts[0])
-        aspect = cw / ch if ch > 0 else 1.0
-
-        # Wide flat shape = necklace
-        if aspect > 2.8:
-            raise JewelleryError(
-                "This looks like a necklace. Please upload an earring image."
-            )
-
-        # Could still be a pair merged into one blob
-        # → try midline split first
-        result = _split_by_midline(pil_rgb)
-        if result is not None:
-            print("[analyze] single blob → tried midline split → success")
-            return result
-
-        # Genuinely single earring
+        x,y,cw,ch = cv2.boundingRect(cnts[0])
+        if cw>0 and cw/ch > 2.8:
+            raise JewelleryError("This looks like a necklace. Please upload an earring image.")
         return _crop_one_contour(rgba, cnts[0]), "single"
 
-    # ── Two or more blobs ──────────────────────────────────────────
-    if len(cnts) >= 2:
+    a0,a1 = cv2.contourArea(cnts[0]), cv2.contourArea(cnts[1])
+    if a0>0 and a1/a0 > 0.25:
+        best = max(cnts[:2], key=_earring_score)
+        return _crop_one_contour(rgba, best), "pair"
+    return _crop_one_contour(rgba, cnts[0]), "single"
 
-        # Try contour split first (cleanest result)
-        result = _split_by_contours(rgba)
-        if result is not None:
-            print("[analyze] two blobs → contour split → success")
-            return result
 
-        # Contour split failed (blobs overlap / too unequal)
-        # → try midline split on original image
-        result = _split_by_midline(pil_rgb)
-        if result is not None:
-            print("[analyze] two blobs → midline split → success")
-            return result
+# ═══════════════════════════════════════════════════════════════════
+#  NECKLACE EXTRACTION — NEW
+# ═══════════════════════════════════════════════════════════════════
 
-        # Take the best single contour (largest + tallest)
-        best = max(cnts, key=_earring_score)
-        print("[analyze] two blobs → best contour fallback")
-        return _crop_one_contour(rgba, best), "single"
+def extract_necklace(rgba: np.ndarray) -> np.ndarray:
+    """
+    Extract necklace from a BG-removed RGBA image.
 
-    # ── No contours but some alpha ─────────────────────────────────
-    if alpha.max() > 50:
-        result = _split_by_midline(pil_rgb)
-        if result is not None:
-            return result
-        return _full_image_fallback(rgba)
+    Strategy:
+    1. Find all foreground contours in the alpha mask.
+    2. The necklace is the LARGEST connected component.
+    3. Find its bounding box.
+    4. Detect chain ends: scan for the leftmost and rightmost non-zero
+       alpha columns at the TOP 30% of the bounding box (chain hangs there).
+    5. Crop from left-chain-end to right-chain-end, full height.
+    6. This gives a crop that spans exactly from one chain end to the other.
+    """
+    H, W  = rgba.shape[:2]
+    alpha = rgba[:,:,3]
 
-    raise JewelleryError(
-        "No jewellery detected. Please upload a clearer earring image "
-        "with a simple background."
-    )
+    if alpha.max() < 15:
+        raise JewelleryError("No necklace detected. Please upload a clearer image.")
+
+    binary = _clean_mask(alpha)
+    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not cnts:
+        # Fallback: tight crop of entire BG-removed image
+        return _tight_crop(rgba)
+
+    # Take the single largest contour = the necklace
+    main = max(cnts, key=cv2.contourArea)
+    x, y, cw, ch = cv2.boundingRect(main)
+
+    # Validate: necklace is typically WIDE (aspect ratio > 0.8)
+    aspect = cw / ch if ch > 0 else 1
+    if aspect < 0.4:
+        # Too narrow — might be earring uploaded by mistake
+        raise JewelleryError(
+            "This looks like an earring, not a necklace. "
+            "Please upload a necklace image."
+        )
+
+    # ── Find chain ends in top 30% of the necklace bounding box ──
+    # The chain/clasp top edge is where the necklace is worn from
+    top_region_h = max(int(ch * 0.30), 10)
+    top_alpha    = alpha[y : y + top_region_h, x : x + cw]
+
+    # Columns in the top region that have ANY foreground pixels
+    col_has_fg   = np.any(top_alpha > 20, axis=0)
+    fg_cols      = np.where(col_has_fg)[0]
+
+    if len(fg_cols) > 0:
+        chain_left  = x + fg_cols[0]          # leftmost chain-end column
+        chain_right = x + fg_cols[-1]         # rightmost chain-end column
+    else:
+        chain_left  = x
+        chain_right = x + cw
+
+    # Add padding
+    pad = 16
+    x1 = max(0, chain_left  - pad)
+    x2 = min(W, chain_right + pad)
+    y1 = max(0, y - pad)
+    y2 = min(H, y + ch + pad)
+
+    print(f"[necklace] bbox x={x} y={y} w={cw} h={ch} aspect={aspect:.2f}")
+    print(f"[necklace] chain ends: left={chain_left} right={chain_right}")
+
+    # Zero out pixels outside the main necklace contour
+    solo = np.zeros((H, W), np.uint8)
+    cv2.drawContours(solo, [main], -1, 255, cv2.FILLED)
+    out = rgba.copy()
+    out[:,:,3] = np.minimum(out[:,:,3], solo)
+
+    return out[y1:y2, x1:x2]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -332,35 +297,42 @@ def analyze_jewellery(rgba: np.ndarray, pil_rgb: Image.Image):
 # ═══════════════════════════════════════════════════════════════════
 
 @app.post("/process-image")
-async def process_image(file: UploadFile = File(...)):
+async def process_image(
+    file: UploadFile = File(...),
+    type: Optional[str] = Form("earring")   # "earring" | "necklace"
+):
     try:
         ct = (file.content_type or "").lower()
         if not ct.startswith("image/"):
-            return JSONResponse(400, content={"error": "Please upload a valid image (JPG, PNG, WEBP)."})
+            return JSONResponse(400, content={"error": "Please upload a valid image."})
 
         raw     = await file.read()
         pil_img = Image.open(io.BytesIO(raw)).convert("RGB")
-        orig_w, orig_h = pil_img.size
-        print(f"[request] {file.filename}  {orig_w}×{orig_h}")
+        ow, oh  = pil_img.size
+        print(f"\n[req] type={type}  {file.filename}  {ow}×{oh}")
 
-        # Step 1: BG removal on full image
+        # Step 1: BG removal
         rgba = remove_background(pil_img)
+        if rgba.shape[:2] != (oh, ow):
+            rgba = cv2.resize(rgba, (ow, oh), interpolation=cv2.INTER_LANCZOS4)
 
-        # Restore resolution if BG remover resized
-        rh, rw = rgba.shape[:2]
-        if (rh, rw) != (orig_h, orig_w):
-            rgba = cv2.resize(rgba, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
-
-        # Step 2: Extract single earring (pair-aware)
+        # Step 2: Extract based on jewellery type
         try:
-            processed, j_type = analyze_jewellery(rgba, pil_img)
+            if type == "necklace":
+                processed = extract_necklace(rgba)
+                j_type    = "necklace"
+            else:
+                processed, j_type = extract_earring(rgba, pil_img)
         except JewelleryError as je:
             return JSONResponse(400, content={"error": str(je)})
 
-        ph, pw = processed.shape[:2]
-        print(f"[output] {pw}×{ph} type={j_type}")
+        # Step 3: ENHANCE — boost design visibility
+        processed = enhance_jewellery(processed)
 
-        # Step 3: Lossless PNG
+        ph, pw = processed.shape[:2]
+        print(f"[out] {pw}×{ph}  type={j_type}")
+
+        # Step 4: Lossless PNG
         out = Image.fromarray(processed.astype(np.uint8), "RGBA")
         buf = io.BytesIO()
         out.save(buf, format="PNG", compress_level=1)

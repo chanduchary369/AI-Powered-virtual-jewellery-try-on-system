@@ -1,3 +1,8 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  SG JEWELS · App.jsx  v8 — Production Grade
+//  Earring + Necklace Real-Time Try-On with Smart Recommendations
+// ═══════════════════════════════════════════════════════════════════════════
+
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { FaceMesh } from "@mediapipe/face_mesh";
 import { Camera } from "@mediapipe/camera_utils";
@@ -5,70 +10,66 @@ import "./styles.css";
 
 const BACKEND_URL = "http://localhost:8000/process-image";
 
-// ═══════════════════════════════════════════════════════════════════
-//  SMOOTHING
-// ═══════════════════════════════════════════════════════════════════
-const SMOOTH_N  = 14;
-const MAX_DELTA = 4;
-let lBuf = [], rBuf = [], nBuf = [];   // nBuf = necklace centre
+// ─── Stability tuning ────────────────────────────────────────────────────
+const SMOOTH_EAR  = 18;   // earring buffer size
+const SMOOTH_NECK = 22;   // necklace buffer (slower for stability)
+const MAX_DELTA   = 4;    // pixel velocity clamp
 
-function pushBuf(buf, pt) {
+let lBuf = [], rBuf = [], nBuf = [];
+
+function pushBuf(buf, pt, maxN = SMOOTH_EAR) {
   if (buf.length > 0) {
     const last = buf[buf.length - 1];
     const dx = pt.x - last.x, dy = pt.y - last.y;
-    const d  = Math.hypot(dx, dy);
-    if (d > MAX_DELTA) { const r = MAX_DELTA / d; pt = { x: last.x + dx*r, y: last.y + dy*r }; }
+    const d = Math.hypot(dx, dy);
+    if (d > MAX_DELTA) {
+      const r = MAX_DELTA / d;
+      pt = { x: last.x + dx * r, y: last.y + dy * r };
+    }
   }
   buf.push({ x: pt.x, y: pt.y });
-  if (buf.length > SMOOTH_N) buf.shift();
+  if (buf.length > maxN) buf.shift();
   const s = buf.reduce((a, b) => ({ x: a.x + b.x, y: a.y + b.y }), { x: 0, y: 0 });
   return { x: s.x / buf.length, y: s.y / buf.length };
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 //  GEOMETRY
-// ═══════════════════════════════════════════════════════════════════
-function faceWidth(lm, W)  { return Math.abs(lm[454].x * W - lm[234].x * W); }
+// ═══════════════════════════════════════════════════════════════════════════
+function faceWidth (lm, W) { return Math.abs(lm[454].x * W - lm[234].x * W); }
 function faceHeight(lm, H) { return Math.abs(lm[10].y  * H - lm[152].y * H); }
 
 function getHeadTilt(lm, W, H) {
-  return Math.atan2(lm[263].y * H - lm[33].y * H, lm[263].x * W - lm[33].x * W);
+  return Math.atan2(
+    lm[263].y * H - lm[33].y * H,
+    lm[263].x * W - lm[33].x * W
+  );
 }
 
-// ─── EAR ANCHOR ──────────────────────────────────────────────────
+// ─── EAR ANCHOR (anatomically correct, eye-corner based) ────────────────
 function earAnchor(lm, side, W, H) {
+  const fw      = faceWidth(lm, W);
+  const fh      = faceHeight(lm, H);
+  const avgEyeY = ((lm[33].y + lm[263].y) / 2) * H;
+  const lobeY   = avgEyeY + fh * 0.20;   // earlobe is anatomically here
+
   if (side === "L") {
-    const p1 = lm[177], p2 = lm[93], p3 = lm[234];
-    return { x: (p1.x + p2.x + p3.x) / 3 * W, y: (p1.y + p2.y) / 2 * H };
-  } else {
-    const p1 = lm[401], p2 = lm[323], p3 = lm[454];
-    return { x: (p1.x + p2.x + p3.x) / 3 * W, y: (p1.y + p2.y) / 2 * H };
+    return { x: lm[234].x * W - fw * 0.03, y: lobeY };
   }
+  return { x: lm[454].x * W + fw * 0.03, y: lobeY };
 }
 
-// ─── NECKLACE ANCHOR ─────────────────────────────────────────────
-//  Uses neck/chin landmarks to position necklace accurately:
-//  lm[152] = chin bottom, lm[200] = chin centre, lm[18] = lower lip bottom
-//  lm[8]   = nose bottom, lm[175] = lower throat area
-//  Width based on shoulder/neck width using lm[234] and lm[454]
+// ─── NECKLACE ANCHOR (neck top, just below chin) ────────────────────────
 function necklaceAnchor(lm, W, H) {
-  const fw   = faceWidth(lm, W);
-  const fh   = faceHeight(lm, H);
-  const chinY = lm[152].y * H;
-
-  // Centre X = face centre
+  const fw      = faceWidth(lm, W);
+  const fh      = faceHeight(lm, H);
+  const chinY   = lm[152].y * H;
   const centreX = (lm[234].x * W + lm[454].x * W) / 2;
-
-  // Necklace top sits just below the chin — 8% of face height below chin
-  const topY = chinY + fh * 0.08;
-
-  // Necklace width = 1.6× face width to span collar bone area
-  const neckW = fw * 1.6;
-
-  return { centreX, topY, neckW };
+  const topY    = chinY + fh * 0.12;     // 12% below chin = neck top
+  return { centreX, topY, neckWidthBase: fw * 1.45 };
 }
 
-// ─── YAW & PITCH OPACITY ──────────────────────────────────────────
+// ─── OPACITY (head rotation occlusion) ──────────────────────────────────
 function yawOpacity(lm, W) {
   const noseX  = lm[4].x * W;
   const lx     = lm[234].x * W, rx = lm[454].x * W;
@@ -79,149 +80,238 @@ function yawOpacity(lm, W) {
   return {
     L: Math.max(0, Math.min(1, (norm + 0.32) / 0.18)),
     R: Math.max(0, Math.min(1, (0.32 - norm) / 0.18)),
-    N: Math.max(0.2, 1 - Math.abs(norm) * 1.2),   // necklace fades when turned
+    N: Math.max(0.30, 1 - Math.abs(norm) * 1.1),
   };
 }
 
 function pitchOpacity(lm, H) {
   const topY = lm[10].y * H, noseY = lm[4].y * H, chinY = lm[152].y * H;
-  const fh   = chinY - topY;
+  const fh = chinY - topY;
   if (fh < 1) return 1;
-  const ratio    = (noseY - topY) / fh;
+  const ratio = (noseY - topY) / fh;
   const tiltDown = Math.max(0, (ratio - 0.60) / 0.10);
   return Math.max(0, 1 - tiltDown);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CANVAS DRAWING HELPERS
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  CANVAS RENDERING (with metallic shine)
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ── Draw earring with ENHANCED brightness/contrast/glow ──────────
 function drawEarring(ctx, img, cx, cy, w, h, angle, alpha, flipH) {
-  if (alpha <= 0.01) return;
+  if (alpha <= 0.01 || !img) return;
   ctx.save();
+  ctx.globalAlpha = Math.min(0.96, alpha);
 
-  // HIGHLIGHT: create glow effect using composite layer
-  ctx.globalAlpha   = Math.min(0.95, alpha);
-  ctx.shadowColor   = "rgba(255, 215, 0, 0.55)";   // gold glow
-  ctx.shadowBlur    = 18;
+  // Gold glow shadow
+  ctx.shadowColor   = "rgba(255, 200, 60, 0.45)";
+  ctx.shadowBlur    = 14;
   ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 0;
+  ctx.shadowOffsetY = 2;
 
   ctx.translate(cx, cy);
   ctx.rotate(angle);
   if (flipH) ctx.scale(-1, 1);
 
-  // Draw earring normally
-  ctx.drawImage(img, 0, 0, img.width, img.height, -w / 2, -h * 0.15, w, h);
+  // Pass 1 — base draw, top edge at anchor
+  ctx.drawImage(img, -w / 2, 0, w, h);
 
-  // SECOND PASS: overlay with lighter composite for brightness boost
+  // Pass 2 — metallic shine via screen blend
   ctx.globalCompositeOperation = "screen";
-  ctx.globalAlpha = Math.min(0.18, alpha * 0.2);
-  ctx.drawImage(img, 0, 0, img.width, img.height, -w / 2, -h * 0.15, w, h);
+  ctx.globalAlpha = Math.min(0.18, alpha * 0.20);
+  ctx.shadowBlur = 0;
+  ctx.drawImage(img, -w / 2, 0, w, h);
 
   ctx.globalCompositeOperation = "source-over";
   ctx.restore();
 }
 
-// ── Draw necklace with highlight & glow ──────────────────────────
 function drawNecklace(ctx, img, centreX, topY, neckW, alpha) {
-  if (alpha <= 0.01) return;
-
-  // Scale: necklace height is proportional to its natural aspect ratio
+  if (alpha <= 0.01 || !img) return;
   const aspect = img.naturalHeight / img.naturalWidth || 1;
-  const neckH  = neckW * aspect;
+  const neckH = neckW * aspect;
 
   ctx.save();
+  ctx.globalAlpha = Math.min(0.97, alpha);
 
-  // HIGHLIGHT: warm gold glow matching jewellery
-  ctx.shadowColor   = "rgba(255, 210, 80, 0.6)";
-  ctx.shadowBlur    = 22;
-  ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 0;
+  ctx.shadowColor   = "rgba(255, 195, 70, 0.55)";
+  ctx.shadowBlur    = 18;
+  ctx.shadowOffsetY = 3;
 
-  ctx.globalAlpha = Math.min(0.96, alpha);
+  ctx.drawImage(img, centreX - neckW / 2, topY, neckW, neckH);
 
-  // Draw necklace centred horizontally, hanging from topY
-  ctx.drawImage(
-    img,
-    centreX - neckW / 2,
-    topY,
-    neckW,
-    neckH
-  );
-
-  // SECOND PASS: screen blend for brightness/shine boost
+  // Shine pass
   ctx.globalCompositeOperation = "screen";
   ctx.globalAlpha = Math.min(0.20, alpha * 0.22);
+  ctx.shadowBlur = 0;
   ctx.drawImage(img, centreX - neckW / 2, topY, neckW, neckH);
 
   ctx.globalCompositeOperation = "source-over";
   ctx.restore();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  FACE SHAPE
-// ═══════════════════════════════════════════════════════════════════
-function detectFaceShape(lm, W, H) {
-  const fw = faceWidth(lm, W), fh = faceHeight(lm, H);
+// ═══════════════════════════════════════════════════════════════════════════
+//  FACE SHAPE — 7 categories with stabilisation
+// ═══════════════════════════════════════════════════════════════════════════
+
+function classifyFaceShape(lm, W, H) {
+  const fw = faceWidth(lm, W);
+  const fh = faceHeight(lm, H);
   if (fw < 10) return null;
+
   const ratio     = fh / fw;
   const jawW      = Math.abs(lm[172].x * W - lm[397].x * W);
   const foreheadW = Math.abs(lm[103].x * W - lm[332].x * W);
-  if (ratio > 1.5)                             return "Oval";
-  if (ratio > 1.3 && foreheadW > jawW * 1.05) return "Heart";
-  if (ratio < 1.15 && jawW / fw > 0.82)       return "Square";
-  if (ratio > 1.2)                             return "Round";
-  return "Rectangle";
+  const cheekW    = fw;
+  const chinW     = Math.abs(lm[140].x * W - lm[369].x * W);
+
+  const jawRatio   = jawW / fw;
+  const fhRatio    = foreheadW / fw;
+  const chinRatio  = chinW / fw;
+
+  // Diamond: cheekbones widest, narrow forehead and jaw
+  if (cheekW > foreheadW * 1.10 && cheekW > jawW * 1.10 && ratio > 1.20)
+    return "Diamond";
+
+  // Heart: wide forehead, narrow chin
+  if (ratio > 1.20 && foreheadW > jawW * 1.08 && chinRatio < 0.55)
+    return "Heart";
+
+  // Triangle: narrow forehead, wide jaw (inverse heart)
+  if (ratio > 1.20 && jawW > foreheadW * 1.10)
+    return "Triangle";
+
+  // Oblong / Rectangle: very long with straight sides
+  if (ratio > 1.50 && jawRatio < 0.85)
+    return "Oblong";
+
+  // Square: nearly equal H/W with strong jaw
+  if (ratio < 1.20 && jawRatio > 0.85)
+    return "Square";
+
+  // Round: moderately tall, soft jaw, balanced
+  if (ratio < 1.35 && jawRatio < 0.85 && jawRatio > 0.70)
+    return "Round";
+
+  // Default: Oval
+  return "Oval";
 }
 
+// ─── Stabilisation: majority vote over last 15 classifications ──────────
+const SHAPE_HISTORY_SIZE = 15;
+const SHAPE_VOTE_THRESHOLD = 9;
+let shapeHistory = [];
+
+function stableFaceShape(newShape) {
+  if (newShape) shapeHistory.push(newShape);
+  if (shapeHistory.length > SHAPE_HISTORY_SIZE) shapeHistory.shift();
+
+  const counts = {};
+  shapeHistory.forEach(s => { counts[s] = (counts[s] || 0) + 1; });
+  let winner = null, maxCount = 0;
+  for (const s in counts) {
+    if (counts[s] > maxCount) { maxCount = counts[s]; winner = s; }
+  }
+  return maxCount >= SHAPE_VOTE_THRESHOLD ? winner : null;
+}
+
+// ─── Recommendation knowledge base (earring + necklace per shape) ───────
 const SHAPE_DATA = {
-  Oval:      { emoji: "🥚", tip: "Any style suits you!",             rec: "Chandelier Earrings",      color: "#7a9e7e" },
-  Round:     { emoji: "⭕", tip: "Elongate with vertical earrings.",  rec: "Long Drop Earrings",       color: "#9e7a7a" },
-  Square:    { emoji: "◼️", tip: "Soften angles with curves.",        rec: "Hoop Earrings",            color: "#7a879e" },
-  Heart:     { emoji: "🫀", tip: "Balance with wider base styles.",   rec: "Teardrop Earrings",        color: "#9e7a94" },
-  Rectangle: { emoji: "▬",  tip: "Add width with cluster styles.",    rec: "Cluster / Stud Earrings", color: "#9e9a7a" },
+  Oval: {
+    emoji: "🥚",
+    color: "#7a9e7e",
+    tip: "Balanced proportions — almost any style works for you.",
+    earring: "Chandelier or Drop Earrings",
+    necklace: "Long Pendant or Princess-length Necklace",
+  },
+  Round: {
+    emoji: "⭕",
+    color: "#9e7a7a",
+    tip: "Vertical lines elongate your face beautifully.",
+    earring: "Long Drop or Linear Earrings",
+    necklace: "V-shape Pendant or Long Chain",
+  },
+  Square: {
+    emoji: "◼️",
+    color: "#7a879e",
+    tip: "Curves soften your strong jawline.",
+    earring: "Hoop or Round Drop Earrings",
+    necklace: "Round Pendant or Curved Collar",
+  },
+  Heart: {
+    emoji: "🫀",
+    color: "#9e7a94",
+    tip: "Wider base styles balance your forehead.",
+    earring: "Teardrop or Inverted Triangle",
+    necklace: "Choker or Short Statement Necklace",
+  },
+  Diamond: {
+    emoji: "💎",
+    color: "#94739e",
+    tip: "Highlight your cheekbones with elegance.",
+    earring: "Stud or Small Hoop Earrings",
+    necklace: "Princess-length with Pendant",
+  },
+  Oblong: {
+    emoji: "📏",
+    color: "#9e9a7a",
+    tip: "Add width with horizontal-emphasis pieces.",
+    earring: "Wide Stud or Cluster Earrings",
+    necklace: "Choker or Layered Short Necklace",
+  },
+  Triangle: {
+    emoji: "🔻",
+    color: "#7a9e94",
+    tip: "Top-heavy designs balance your wider jaw.",
+    earring: "Chandelier or Wide-top Earrings",
+    necklace: "Statement Collar or Bib Necklace",
+  },
 };
 
-// ═══════════════════════════════════════════════════════════════════
-//  APP
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  APP COMPONENT
+// ═══════════════════════════════════════════════════════════════════════════
+
 export default function App() {
   const videoRef    = useRef(null);
   const canvasRef   = useRef(null);
   const earringRef  = useRef(null);
   const necklaceRef = useRef(null);
   const scaleRef    = useRef(1.0);
-  const modeRef     = useRef("earring");   // "earring" | "necklace" | "both"
+  const necklaceScaleRef = useRef(1.0);
+  const offsetYRef  = useRef(0);
+  const modeRef     = useRef("earring");
 
-  const [earring,      setEarring]      = useState(null);
-  const [necklace,     setNecklace]     = useState(null);
-  const [activeMode,   setActiveMode]   = useState("earring");
-  const [scale,        setScale]        = useState(1.0);
-  const [status,       setStatus]       = useState("idle");
-  const [neckStatus,   setNeckStatus]   = useState("idle");
-  const [statusMsg,    setStatusMsg]    = useState("");
-  const [neckMsg,      setNeckMsg]      = useState("");
-  const [faceShape,    setFaceShape]    = useState(null);
-  const [captureURL,   setCaptureURL]   = useState(null);
-  const [showModal,    setShowModal]    = useState(false);
-  const [cameraReady,  setCameraReady]  = useState(false);
-  const [faceDetected, setFaceDetected] = useState(false);
+  const [earring,         setEarring]         = useState(null);
+  const [necklace,        setNecklace]        = useState(null);
+  const [activeMode,      setActiveMode]      = useState("earring");
+  const [scale,           setScale]           = useState(1.0);
+  const [necklaceScale,   setNecklaceScale]   = useState(1.0);
+  const [offsetY,         setOffsetY]         = useState(0);
+  const [earStatus,       setEarStatus]       = useState("idle");
+  const [neckStatus,      setNeckStatus]      = useState("idle");
+  const [earMsg,          setEarMsg]          = useState("");
+  const [neckMsg,         setNeckMsg]         = useState("");
+  const [faceShape,       setFaceShape]       = useState(null);
+  const [captureURL,      setCaptureURL]      = useState(null);
+  const [showModal,       setShowModal]       = useState(false);
+  const [cameraReady,     setCameraReady]     = useState(false);
+  const [faceDetected,    setFaceDetected]    = useState(false);
 
-  useEffect(() => { earringRef.current  = earring;    }, [earring]);
-  useEffect(() => { necklaceRef.current = necklace;   }, [necklace]);
-  useEffect(() => { scaleRef.current    = scale;      }, [scale]);
-  useEffect(() => { modeRef.current     = activeMode; }, [activeMode]);
+  useEffect(() => { earringRef.current  = earring;       }, [earring]);
+  useEffect(() => { necklaceRef.current = necklace;      }, [necklace]);
+  useEffect(() => { scaleRef.current    = scale;         }, [scale]);
+  useEffect(() => { necklaceScaleRef.current = necklaceScale; }, [necklaceScale]);
+  useEffect(() => { offsetYRef.current  = offsetY;       }, [offsetY]);
+  useEffect(() => { modeRef.current     = activeMode;    }, [activeMode]);
 
-  // ─── FACEMESH LOOP ──────────────────────────────────────────────
+  // ─── FaceMesh Loop ─────────────────────────────────────────────
   useEffect(() => {
     const mesh = new FaceMesh({
       locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`,
     });
     mesh.setOptions({
-      maxNumFaces:            1,
-      refineLandmarks:        true,
+      maxNumFaces: 1,
+      refineLandmarks: true,
       minDetectionConfidence: 0.65,
       minTrackingConfidence:  0.65,
     });
@@ -231,8 +321,8 @@ export default function App() {
       if (!canvas) return;
       const ctx = canvas.getContext("2d");
 
-      ctx.imageSmoothingEnabled  = true;
-      ctx.imageSmoothingQuality  = "high";
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(res.image, 0, 0, canvas.width, canvas.height);
 
@@ -240,41 +330,47 @@ export default function App() {
       setFaceDetected(hasLM);
       if (!hasLM) return;
 
-      const lm  = res.multiFaceLandmarks[0];
-      const W   = canvas.width;
-      const H   = canvas.height;
-      const fw  = faceWidth(lm, W);
+      const lm = res.multiFaceLandmarks[0];
+      const W = canvas.width, H = canvas.height;
+      const fw = faceWidth(lm, W);
       const tilt = getHeadTilt(lm, W, H);
-      const yaw   = yawOpacity(lm, W);
+      const yaw = yawOpacity(lm, W);
       const pitch = pitchOpacity(lm, H);
-      const mode  = modeRef.current;
+      const mode = modeRef.current;
 
+      // Face shape — every 5 frames, with stabilisation
       App._fc = ((App._fc || 0) + 1);
-      if (App._fc % 8 === 0) setFaceShape(detectFaceShape(lm, W, H));
-
-      // ── EARRINGS ──────────────────────────────────────────────
-      if ((mode === "earring" || mode === "both") && earringRef.current) {
-        const ew = fw * 0.17 * scaleRef.current;
-        const eh = ew * 2.3;
-        const rawL = earAnchor(lm, "L", W, H);
-        const rawR = earAnchor(lm, "R", W, H);
-        const ancL = pushBuf(lBuf, rawL);
-        const ancR = pushBuf(rBuf, rawR);
-        drawEarring(ctx, earringRef.current,  ancL.x, ancL.y, ew, eh, tilt, yaw.L * pitch, false);
-        drawEarring(ctx, earringRef.current,  ancR.x, ancR.y, ew, eh, tilt, yaw.R * pitch, true);
+      if (App._fc % 5 === 0) {
+        const raw = classifyFaceShape(lm, W, H);
+        const stable = stableFaceShape(raw);
+        if (stable) setFaceShape(stable);
       }
 
-      // ── NECKLACE ──────────────────────────────────────────────
+      // ── EARRINGS ─────────────────────────────────────────
+      if ((mode === "earring" || mode === "both") && earringRef.current) {
+        const ew = fw * 0.19 * scaleRef.current;
+        const eh = ew * 2.2;
+        const rawL = earAnchor(lm, "L", W, H);
+        const rawR = earAnchor(lm, "R", W, H);
+        const ancL = pushBuf(lBuf, rawL, SMOOTH_EAR);
+        const ancR = pushBuf(rBuf, rawR, SMOOTH_EAR);
+
+        drawEarring(ctx, earringRef.current, ancL.x, ancL.y, ew, eh,
+                    tilt, yaw.L * pitch, false);
+        drawEarring(ctx, earringRef.current, ancR.x, ancR.y, ew, eh,
+                    tilt, yaw.R * pitch, true);
+      }
+
+      // ── NECKLACE ─────────────────────────────────────────
       if ((mode === "necklace" || mode === "both") && necklaceRef.current) {
-        const { centreX, topY, neckW } = necklaceAnchor(lm, W, H);
-        const rawN = { x: centreX, y: topY };
-        const ancN = pushBuf(nBuf, rawN);
+        const { centreX, topY, neckWidthBase } = necklaceAnchor(lm, W, H);
+        const adjustedY = topY + offsetYRef.current;
+        const rawN = { x: centreX, y: adjustedY };
+        const ancN = pushBuf(nBuf, rawN, SMOOTH_NECK);
+        const neckW = neckWidthBase * necklaceScaleRef.current;
 
-        // Recalculate neckW fresh each frame (face may have moved/resized)
-        const freshFW   = faceWidth(lm, W);
-        const freshNeckW = freshFW * 1.6 * scaleRef.current;
-
-        drawNecklace(ctx, necklaceRef.current, ancN.x, ancN.y, freshNeckW, yaw.N * pitch);
+        drawNecklace(ctx, necklaceRef.current, ancN.x, ancN.y,
+                     neckW, yaw.N * pitch);
       }
     });
 
@@ -286,53 +382,47 @@ export default function App() {
     return () => { cam.stop(); mesh.close(); };
   }, []);
 
-  // ─── UPLOAD EARRING ─────────────────────────────────────────────
+  // ─── Upload Handlers ────────────────────────────────────────────
+  const uploadJewellery = async (file, type, setStatus, setMsg) => {
+    if (!file.type.startsWith("image/")) {
+      setStatus("error"); setMsg("Please upload a valid image."); return null;
+    }
+    setStatus("loading"); setMsg("Processing…");
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("type", type);
+      const res = await fetch(BACKEND_URL, { method: "POST", body: form });
+      const ct = res.headers.get("content-type") || "";
+      if (!res.ok || ct.includes("application/json")) {
+        const json = await res.json();
+        setStatus("error"); setMsg(json.error || "Server error."); return null;
+      }
+      const blob = await res.blob();
+      const img = new Image();
+      return new Promise((resolve) => {
+        img.onload  = () => { setStatus("loaded"); setMsg(`${type === "necklace" ? "Necklace" : "Earring"} ready ✓`); resolve(img); };
+        img.onerror = () => { setStatus("error"); setMsg("Could not load image."); resolve(null); };
+        img.src = URL.createObjectURL(blob);
+      });
+    } catch {
+      setStatus("error"); setMsg("Backend not reachable."); return null;
+    }
+  };
+
   const handleEarringFile = useCallback(async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith("image/")) { setStatus("error"); setStatusMsg("Please upload a valid image."); return; }
-    setStatus("loading"); setStatusMsg("Processing earring…");
-    try {
-      const form = new FormData();
-      form.append("file", file);
-      form.append("type", "earring");
-      const res = await fetch(BACKEND_URL, { method: "POST", body: form });
-      const ct  = res.headers.get("content-type") || "";
-      if (!res.ok || ct.includes("application/json")) {
-        const json = await res.json();
-        setStatus("error"); setStatusMsg(json.error || "Server error."); return;
-      }
-      const blob = await res.blob();
-      const img  = new Image();
-      img.onload = () => { lBuf = []; rBuf = []; setEarring(img); setStatus("loaded"); setStatusMsg("Earring ready ✓"); };
-      img.src = URL.createObjectURL(blob);
-    } catch { setStatus("error"); setStatusMsg("Backend not reachable."); }
+    const file = e.target.files?.[0]; if (!file) return;
+    const img = await uploadJewellery(file, "earring", setEarStatus, setEarMsg);
+    if (img) { lBuf = []; rBuf = []; setEarring(img); }
   }, []);
 
-  // ─── UPLOAD NECKLACE ────────────────────────────────────────────
   const handleNecklaceFile = useCallback(async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith("image/")) { setNeckStatus("error"); setNeckMsg("Please upload a valid image."); return; }
-    setNeckStatus("loading"); setNeckMsg("Processing necklace…");
-    try {
-      const form = new FormData();
-      form.append("file", file);
-      form.append("type", "necklace");
-      const res = await fetch(BACKEND_URL, { method: "POST", body: form });
-      const ct  = res.headers.get("content-type") || "";
-      if (!res.ok || ct.includes("application/json")) {
-        const json = await res.json();
-        setNeckStatus("error"); setNeckMsg(json.error || "Server error."); return;
-      }
-      const blob = await res.blob();
-      const img  = new Image();
-      img.onload = () => { nBuf = []; setNecklace(img); setNeckStatus("loaded"); setNeckMsg("Necklace ready ✓"); };
-      img.src = URL.createObjectURL(blob);
-    } catch { setNeckStatus("error"); setNeckMsg("Backend not reachable."); }
+    const file = e.target.files?.[0]; if (!file) return;
+    const img = await uploadJewellery(file, "necklace", setNeckStatus, setNeckMsg);
+    if (img) { nBuf = []; setNecklace(img); }
   }, []);
 
-  // ─── CAPTURE ────────────────────────────────────────────────────
+  // ─── Capture & Download ─────────────────────────────────────────
   const handleCapture = useCallback(() => {
     const c = canvasRef.current; if (!c) return;
     const ec = document.createElement("canvas");
@@ -352,23 +442,18 @@ export default function App() {
     a.href = captureURL; a.click();
   }, [captureURL]);
 
+  // ─── UI Helpers ─────────────────────────────────────────────────
   const shapeData = faceShape ? SHAPE_DATA[faceShape] : null;
+  const cfg = (st, msg, fallback) => ({
+    idle:    { cls: "",        label: fallback },
+    loading: { cls: "loading", label: msg || "Processing…" },
+    loaded:  { cls: "success", label: msg },
+    error:   { cls: "error",   label: msg },
+  })[st];
+  const earCfg  = cfg(earStatus,  earMsg,  "Upload an earring");
+  const neckCfg = cfg(neckStatus, neckMsg, "Upload a necklace");
 
-  const earStatusConfig = {
-    idle:    { cls: "",        label: "Upload an earring image" },
-    loading: { cls: "loading", label: statusMsg || "Processing…" },
-    loaded:  { cls: "success", label: statusMsg },
-    error:   { cls: "error",   label: statusMsg },
-  }[status];
-
-  const neckStatusConfig = {
-    idle:    { cls: "",        label: "Upload a necklace image" },
-    loading: { cls: "loading", label: neckMsg || "Processing…" },
-    loaded:  { cls: "success", label: neckMsg },
-    error:   { cls: "error",   label: neckMsg },
-  }[neckStatus];
-
-  // ═══════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════
   return (
     <div className="sg-app">
 
@@ -392,68 +477,89 @@ export default function App() {
 
         <aside className="sg-panel">
 
-          {/* ── MODE TABS ─────────────────────────────────── */}
           <section className="sg-card sg-card--tabs">
             <p className="sg-card__label">Try-On Mode</p>
             <div className="sg-tabs">
-              {["earring","necklace","both"].map(m => (
-                <button
-                  key={m}
-                  className={`sg-tab ${activeMode === m ? "sg-tab--active" : ""}`}
-                  onClick={() => setActiveMode(m)}
-                >
-                  {m === "earring" ? "💎 Earrings" : m === "necklace" ? "📿 Necklace" : "✨ Both"}
+              {[
+                { id: "earring",  icon: "💎", label: "Earrings" },
+                { id: "necklace", icon: "📿", label: "Necklace" },
+                { id: "both",     icon: "✨", label: "Both" },
+              ].map(t => (
+                <button key={t.id}
+                  className={`sg-tab ${activeMode === t.id ? "sg-tab--active" : ""}`}
+                  onClick={() => setActiveMode(t.id)}>
+                  {t.icon} {t.label}
                 </button>
               ))}
             </div>
           </section>
 
-          {/* ── EARRING UPLOAD ────────────────────────────── */}
           {(activeMode === "earring" || activeMode === "both") && (
             <section className="sg-card">
               <p className="sg-card__label">Upload Earring</p>
               <label className="sg-upload">
                 <input type="file" accept="image/*" onChange={handleEarringFile} />
                 <span className="sg-upload__icon">💎</span>
-                <span className="sg-upload__text">Choose Earring Image</span>
+                <span className="sg-upload__text">Choose Earring</span>
               </label>
-              {status !== "idle" && (
-                <p className={`sg-status sg-status--${earStatusConfig.cls}`}>{earStatusConfig.label}</p>
+              {earStatus !== "idle" && (
+                <p className={`sg-status sg-status--${earCfg.cls}`}>{earCfg.label}</p>
               )}
               <p className="sg-hint">Single or pair — auto-extracts one</p>
             </section>
           )}
 
-          {/* ── NECKLACE UPLOAD ───────────────────────────── */}
           {(activeMode === "necklace" || activeMode === "both") && (
             <section className="sg-card">
               <p className="sg-card__label">Upload Necklace</p>
               <label className="sg-upload sg-upload--necklace">
                 <input type="file" accept="image/*" onChange={handleNecklaceFile} />
                 <span className="sg-upload__icon">📿</span>
-                <span className="sg-upload__text">Choose Necklace Image</span>
+                <span className="sg-upload__text">Choose Necklace</span>
               </label>
               {neckStatus !== "idle" && (
-                <p className={`sg-status sg-status--${neckStatusConfig.cls}`}>{neckStatusConfig.label}</p>
+                <p className={`sg-status sg-status--${neckCfg.cls}`}>{neckCfg.label}</p>
               )}
-              <p className="sg-hint">Product photo with visible chain ends</p>
+              <p className="sg-hint">Chain ends auto-removed, design isolated</p>
             </section>
           )}
 
-          {/* ── SIZE SLIDER ───────────────────────────────── */}
-          <section className="sg-card">
-            <p className="sg-card__label">Jewellery Size</p>
-            <div className="sg-slider-row">
-              <span className="sg-slider-val">{scale.toFixed(2)}×</span>
-              <input className="sg-slider" type="range" min="0.5" max="1.8" step="0.05"
-                value={scale} onChange={e => setScale(+e.target.value)} />
-            </div>
-          </section>
+          {/* ── SIZE CONTROLS ────────────────────────────── */}
+          {(activeMode === "earring" || activeMode === "both") && earring && (
+            <section className="sg-card">
+              <p className="sg-card__label">Earring Size</p>
+              <div className="sg-slider-row">
+                <span className="sg-slider-val">{scale.toFixed(2)}×</span>
+                <input className="sg-slider" type="range"
+                  min="0.5" max="1.8" step="0.05"
+                  value={scale} onChange={e => setScale(+e.target.value)} />
+              </div>
+            </section>
+          )}
 
-          {/* ── AI FACE SHAPE ─────────────────────────────── */}
+          {(activeMode === "necklace" || activeMode === "both") && necklace && (
+            <section className="sg-card">
+              <p className="sg-card__label">Necklace Size</p>
+              <div className="sg-slider-row">
+                <span className="sg-slider-val">{necklaceScale.toFixed(2)}×</span>
+                <input className="sg-slider" type="range"
+                  min="0.6" max="1.6" step="0.05"
+                  value={necklaceScale} onChange={e => setNecklaceScale(+e.target.value)} />
+              </div>
+              <p className="sg-card__label" style={{ marginTop: 12 }}>Vertical Position</p>
+              <div className="sg-slider-row">
+                <span className="sg-slider-val">{offsetY > 0 ? "+" : ""}{offsetY}</span>
+                <input className="sg-slider" type="range"
+                  min="-40" max="40" step="2"
+                  value={offsetY} onChange={e => setOffsetY(+e.target.value)} />
+              </div>
+            </section>
+          )}
+
+          {/* ── FACE ANALYSIS ──────────────────────────────── */}
           {shapeData && (
             <section className="sg-card sg-card--shape" style={{ "--accent": shapeData.color }}>
-              <p className="sg-card__label">AI Analysis</p>
+              <p className="sg-card__label">AI Face Analysis</p>
               <div className="sg-shape-row">
                 <span className="sg-shape-emoji">{shapeData.emoji}</span>
                 <div>
@@ -461,44 +567,52 @@ export default function App() {
                   <p className="sg-shape-tip">{shapeData.tip}</p>
                 </div>
               </div>
-              <div className="sg-rec">
-                <span className="sg-rec__label">Recommended</span>
-                <span className="sg-rec__val">{shapeData.rec}</span>
+              <div className="sg-recs">
+                <div className="sg-rec">
+                  <span className="sg-rec__label">💎 Earrings</span>
+                  <span className="sg-rec__val">{shapeData.earring}</span>
+                </div>
+                <div className="sg-rec">
+                  <span className="sg-rec__label">📿 Necklace</span>
+                  <span className="sg-rec__val">{shapeData.necklace}</span>
+                </div>
               </div>
             </section>
           )}
 
-          {/* ── CAPTURE ───────────────────────────────────── */}
           <section className="sg-card sg-card--actions">
-            <button className="sg-btn sg-btn--primary" onClick={handleCapture}
+            <button className="sg-btn sg-btn--primary"
+              onClick={handleCapture}
               disabled={!earring && !necklace}>
               📸 Capture Look
             </button>
           </section>
 
-          {/* ── TIPS ──────────────────────────────────────── */}
           <section className="sg-card sg-card--tips">
             <p className="sg-card__label">Tips for best results</p>
             <ul className="sg-tips">
-              <li>Face camera directly for both ears</li>
-              <li>Good lighting = stable tracking</li>
-              <li>Turn head — far ear auto-hides</li>
-              <li>Use necklace product photos with visible chain ends</li>
+              <li>Face camera directly — both ears visible</li>
+              <li>Good lighting reduces tracking jitter</li>
+              <li>Pair photos auto-extract one earring</li>
+              <li>Use vertical slider to fine-tune necklace</li>
             </ul>
           </section>
 
         </aside>
 
-        {/* ── VIEWER ──────────────────────────────────────── */}
         <section className="sg-viewer">
           <div className="sg-canvas-wrap">
             <video ref={videoRef} className="sg-hidden" />
             <canvas ref={canvasRef} width={1920} height={1440} className="sg-canvas" />
             {!cameraReady && (
-              <div className="sg-overlay"><span className="sg-spinner" /><p>Starting camera…</p></div>
+              <div className="sg-overlay">
+                <span className="sg-spinner" /><p>Starting camera…</p>
+              </div>
             )}
             {cameraReady && !faceDetected && (
-              <div className="sg-overlay sg-overlay--hint"><p>👤 Position your face in frame</p></div>
+              <div className="sg-overlay sg-overlay--hint">
+                <p>👤 Position your face in frame</p>
+              </div>
             )}
           </div>
           <p className="sg-viewer__hint">Sri Ganesh Jewellers · sgjewels.in</p>
@@ -506,7 +620,6 @@ export default function App() {
 
       </main>
 
-      {/* ── MODAL ─────────────────────────────────────────── */}
       {showModal && (
         <div className="sg-modal-backdrop" onClick={() => setShowModal(false)}>
           <div className="sg-modal" onClick={e => e.stopPropagation()}>
@@ -514,13 +627,18 @@ export default function App() {
             <p className="sg-modal__title">Your Look ✨</p>
             <img src={captureURL} alt="Try-on result" className="sg-modal__img" />
             <div className="sg-modal__actions">
-              <button className="sg-btn sg-btn--primary" onClick={handleDownload}>⬇ Download HD</button>
-              <button className="sg-btn sg-btn--ghost" onClick={() => setShowModal(false)}>Continue Try-On</button>
+              <button className="sg-btn sg-btn--primary" onClick={handleDownload}>
+                ⬇ Download HD
+              </button>
+              <button className="sg-btn sg-btn--ghost" onClick={() => setShowModal(false)}>
+                Continue Try-On
+              </button>
             </div>
             <p className="sg-modal__brand">Sri Ganesh Jewellers · sgjewels.in</p>
           </div>
         </div>
       )}
+
     </div>
   );
 }

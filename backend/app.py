@@ -359,26 +359,132 @@ def extract_necklace(rgba: np.ndarray) -> np.ndarray:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  STAGE 4 — DESIGN ENHANCEMENT
+#  STAGE 4 — DESIGN ENHANCEMENT  (premium / luxury-grade pipeline)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def enhance_jewellery(rgba: np.ndarray) -> np.ndarray:
-    """Multi-stage enhancement to make designs vivid and detailed."""
-    pil = Image.fromarray(rgba.astype(np.uint8), "RGBA")
-    r, g, b, a = pil.split()
-    rgb = Image.merge("RGB", (r, g, b))
+    """
+    Premium multi-stage jewellery enhancement with HIGH-CONTRAST highlighting.
 
-    rgb = ImageEnhance.Contrast(rgb).enhance(1.40)     # boost design definition
-    rgb = ImageEnhance.Brightness(rgb).enhance(1.10)   # ambient lift
-    rgb = ImageEnhance.Color(rgb).enhance(1.35)        # gold tones pop
-    rgb = ImageEnhance.Sharpness(rgb).enhance(2.20)    # filigree clarity
+    Enhancement is applied ONLY to jewellery pixels via the alpha mask, so the
+    webcam frame, skin, and background are never touched downstream.
 
-    # Slight unsharp mask for fine stone details
-    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80, threshold=2))
+    Pipeline
+    ────────
+      1. Adaptive contrast enhancement   (CLAHE on L channel of LAB)
+      2. Tone curve — deep shadows + bright highlights (S-curve, contrast pop)
+      3. Selective brightness            (gamma lift on midtones)
+      4. Local sharpening                (unsharp mask)
+      5. Edge enhancement                (high-frequency detail boost)
+      6. Color richness improvement      (HSV saturation)
+      7. Gold-tone enhancement           (warm hue saturation + shine lift)
+      8. Specular highlight pass         (bright pixels glow brighter — gold sheen)
+      9. Anti-aliasing refinement        (alpha edge smoothing, interior preserved)
 
-    r2, g2, b2 = rgb.split()
-    enhanced = Image.merge("RGBA", (r2, g2, b2, a))
-    return np.array(enhanced)
+    The S-curve (step 2) plus the specular pass (step 8) are what create the
+    contrasting "lit-up" appearance against the webcam background — bright facets
+    push toward white, deep recesses push toward black, so the design pops on
+    skin instead of looking flat and washed-out.
+    """
+    if rgba is None or rgba.size == 0:
+        return rgba
+
+    rgba = rgba.astype(np.uint8)
+    if rgba.shape[2] != 4:
+        return rgba
+
+    rgb = rgba[:, :, :3].copy()
+    alpha = rgba[:, :, 3].copy()
+
+    # Interior mask: only enhance solid jewellery pixels, leave feathered edges
+    # to blend naturally during overlay.
+    interior_mask = alpha > 30
+    if not interior_mask.any():
+        return rgba
+
+    # ── 1. Adaptive contrast enhancement (CLAHE on L) ────────────────────
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    L, A_lab, B_lab = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    L_eq = clahe.apply(L)
+    # Stronger CLAHE blend than before — recover detail aggressively
+    L_blend = cv2.addWeighted(L_eq, 0.80, L, 0.20, 0)
+    lab_eq = cv2.merge([L_blend, A_lab, B_lab])
+    stage = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+
+    # ── 2. Tone curve — S-curve for contrast pop ─────────────────────────
+    # Pulls shadows down and highlights up so the jewellery reads as
+    # 3-dimensional rather than flat. This is the main "highlighting" step.
+    f = stage.astype(np.float32) / 255.0
+    # Parametric S-curve: y = 0.5 - 0.5*cos(pi*x) gives a smooth contrast lift.
+    # Blend with identity so we don't crush detail.
+    s_curve = 0.5 - 0.5 * np.cos(np.pi * f)
+    f = f * 0.35 + s_curve * 0.65
+    f = np.clip(f, 0.0, 1.0)
+    stage = (f * 255.0).astype(np.uint8)
+
+    # ── 3. Selective brightness — lift midtones ──────────────────────────
+    f = stage.astype(np.float32) / 255.0
+    f = np.power(f, 0.90)
+    stage = (np.clip(f, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    # ── 4. Local sharpening (unsharp mask) ───────────────────────────────
+    blur1 = cv2.GaussianBlur(stage, (0, 0), sigmaX=1.2)
+    stage = cv2.addWeighted(stage, 1.70, blur1, -0.70, 0)
+
+    # ── 5. Edge enhancement — high-frequency detail boost ────────────────
+    blur2 = cv2.GaussianBlur(stage, (0, 0), sigmaX=2.4)
+    stage = cv2.addWeighted(stage, 1.30, blur2, -0.30, 0)
+
+    # ── 6. Color richness (HSV saturation, controlled) ───────────────────
+    hsv = cv2.cvtColor(stage, cv2.COLOR_RGB2HSV).astype(np.float32)
+    H_ch, S_ch, V_ch = cv2.split(hsv)
+    S_ch = np.clip(S_ch * 1.30, 0, 255)
+    V_ch = np.clip(V_ch * 1.05, 0, 255)
+    hsv = cv2.merge([H_ch, S_ch, V_ch]).astype(np.uint8)
+    stage = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    # ── 7. Gold-tone enhancement — warm hue saturation + shine lift ──────
+    hsv2 = cv2.cvtColor(stage, cv2.COLOR_RGB2HSV).astype(np.float32)
+    Hg, Sg, Vg = cv2.split(hsv2)
+    gold_band = ((Hg >= 8) & (Hg <= 48)).astype(np.float32)
+    gold_band = cv2.GaussianBlur(gold_band, (0, 0), sigmaX=2.0)
+    Sg = np.clip(Sg + gold_band * 22.0, 0, 255)
+    Vg = np.clip(Vg + gold_band * 14.0, 0, 255)
+    hsv2 = cv2.merge([Hg, Sg, Vg]).astype(np.uint8)
+    stage = cv2.cvtColor(hsv2, cv2.COLOR_HSV2RGB)
+
+    # ── 8. Specular highlight pass — gold "sheen" ────────────────────────
+    # Detect the brightest 25 % of luminance inside the jewellery and push it
+    # further toward warm-white. Creates the contrasting bright accents that
+    # make the design pop against skin / webcam background.
+    gray = cv2.cvtColor(stage, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    interior_vals = gray[interior_mask]
+    if interior_vals.size > 0:
+        thresh = float(np.percentile(interior_vals, 75))
+        # Soft mask: 0 at threshold, 1 at full bright
+        spec = np.clip((gray - thresh) / max(1.0, 255.0 - thresh), 0.0, 1.0)
+        spec = cv2.GaussianBlur(spec, (0, 0), sigmaX=1.0)
+        # Warm-white tint (R 255, G 244, B 214) for gold sheen
+        warm_white = np.array([255.0, 244.0, 214.0], dtype=np.float32)
+        s3 = stage.astype(np.float32)
+        spec3 = spec[:, :, None]
+        # Strength 0.55 = clearly visible highlight, still natural
+        s3 = s3 * (1.0 - spec3 * 0.55) + warm_white * (spec3 * 0.55)
+        stage = np.clip(s3, 0, 255).astype(np.uint8)
+
+    # ── Compose: replace ONLY interior jewellery pixels ──────────────────
+    out_rgb = rgb.copy()
+    out_rgb[interior_mask] = stage[interior_mask]
+
+    # ── 9. Anti-aliasing refinement on alpha edges ───────────────────────
+    a_f = alpha.astype(np.float32) / 255.0
+    a_smooth = cv2.GaussianBlur(a_f, (0, 0), sigmaX=0.7)
+    solid = a_f > 0.85
+    a_smooth[solid] = a_f[solid]
+    out_alpha = (a_smooth * 255.0).clip(0, 255).astype(np.uint8)
+
+    return np.dstack([out_rgb, out_alpha])
 
 
 # ═══════════════════════════════════════════════════════════════════════════

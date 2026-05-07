@@ -10,27 +10,44 @@ import "./styles.css";
 
 const BACKEND_URL = "http://localhost:8000/process-image";
 
-// ─── Stability tuning ────────────────────────────────────────────────────
-const SMOOTH_EAR  = 18;   // earring buffer size
-const SMOOTH_NECK = 22;   // necklace buffer (slower for stability)
-const MAX_DELTA   = 4;    // pixel velocity clamp
+// ─── Adaptive smoothing (EMA w/ velocity-based alpha + jump snap) ────────
+// Why this replaces the old moving-average buffer:
+//   • Old: avg over 18–22 frames + 4 px/frame velocity clamp → jewellery
+//     visibly "catches up" to the ear when you turn your head fast.
+//   • New: One-Euro-style filter — alpha rises with velocity so fast
+//     movement is followed instantly, but tiny jitter is still smoothed.
+//   • Big position jumps (new person enters frame, tracking flips) trigger
+//     an instant snap instead of slow interpolation.
+const JUMP_THRESHOLD = 90;    // px — beyond this, snap to new position
+const EMA_MIN        = 0.22;  // smoothing factor when face is nearly still
+const EMA_MAX        = 0.70;  // smoothing factor when moving fast
+const VEL_FULL       = 26;    // px/frame velocity that yields EMA_MAX
 
-let lBuf = [], rBuf = [], nBuf = [];
+let lState = null, rState = null, nState = null;
+let noFaceFrames = 0;
 
-function pushBuf(buf, pt, maxN = SMOOTH_EAR) {
-  if (buf.length > 0) {
-    const last = buf[buf.length - 1];
-    const dx = pt.x - last.x, dy = pt.y - last.y;
-    const d = Math.hypot(dx, dy);
-    if (d > MAX_DELTA) {
-      const r = MAX_DELTA / d;
-      pt = { x: last.x + dx * r, y: last.y + dy * r };
-    }
-  }
-  buf.push({ x: pt.x, y: pt.y });
-  if (buf.length > maxN) buf.shift();
-  const s = buf.reduce((a, b) => ({ x: a.x + b.x, y: a.y + b.y }), { x: 0, y: 0 });
-  return { x: s.x / buf.length, y: s.y / buf.length };
+function smoothPoint(state, pt) {
+  if (!state) return { x: pt.x, y: pt.y };
+  const dx = pt.x - state.x;
+  const dy = pt.y - state.y;
+  const d  = Math.hypot(dx, dy);
+
+  // Big jump → likely a new face / tracking reset → snap instantly
+  if (d > JUMP_THRESHOLD) return { x: pt.x, y: pt.y };
+
+  // Velocity-adaptive alpha
+  const t = Math.min(1, d / VEL_FULL);
+  const alpha = EMA_MIN + (EMA_MAX - EMA_MIN) * t;
+  return {
+    x: state.x + dx * alpha,
+    y: state.y + dy * alpha,
+  };
+}
+
+function resetSmoothing() {
+  lState = null;
+  rState = null;
+  nState = null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -80,7 +97,7 @@ function yawOpacity(lm, W) {
   return {
     L: Math.max(0, Math.min(1, (norm + 0.32) / 0.18)),
     R: Math.max(0, Math.min(1, (0.32 - norm) / 0.18)),
-    N: Math.max(0.30, 1 - Math.abs(norm) * 1.1),
+    N: 1,
   };
 }
 
@@ -328,7 +345,14 @@ export default function App() {
 
       const hasLM = res.multiFaceLandmarks?.length > 0;
       setFaceDetected(hasLM);
-      if (!hasLM) return;
+
+      // No face for >5 frames → reset smoothing so next person snaps in cleanly
+      if (!hasLM) {
+        noFaceFrames++;
+        if (noFaceFrames > 5) resetSmoothing();
+        return;
+      }
+      noFaceFrames = 0;
 
       const lm = res.multiFaceLandmarks[0];
       const W = canvas.width, H = canvas.height;
@@ -352,8 +376,8 @@ export default function App() {
         const eh = ew * 2.2;
         const rawL = earAnchor(lm, "L", W, H);
         const rawR = earAnchor(lm, "R", W, H);
-        const ancL = pushBuf(lBuf, rawL, SMOOTH_EAR);
-        const ancR = pushBuf(rBuf, rawR, SMOOTH_EAR);
+        const ancL = (lState = smoothPoint(lState, rawL));
+        const ancR = (rState = smoothPoint(rState, rawR));
 
         drawEarring(ctx, earringRef.current, ancL.x, ancL.y, ew, eh,
                     tilt, yaw.L * pitch, false);
@@ -366,7 +390,7 @@ export default function App() {
         const { centreX, topY, neckWidthBase } = necklaceAnchor(lm, W, H);
         const adjustedY = topY + offsetYRef.current;
         const rawN = { x: centreX, y: adjustedY };
-        const ancN = pushBuf(nBuf, rawN, SMOOTH_NECK);
+        const ancN = (nState = smoothPoint(nState, rawN));
         const neckW = neckWidthBase * necklaceScaleRef.current;
 
         drawNecklace(ctx, necklaceRef.current, ancN.x, ancN.y,
@@ -413,13 +437,13 @@ export default function App() {
   const handleEarringFile = useCallback(async (e) => {
     const file = e.target.files?.[0]; if (!file) return;
     const img = await uploadJewellery(file, "earring", setEarStatus, setEarMsg);
-    if (img) { lBuf = []; rBuf = []; setEarring(img); }
+    if (img) { lState = null; rState = null; setEarring(img); }
   }, []);
 
   const handleNecklaceFile = useCallback(async (e) => {
     const file = e.target.files?.[0]; if (!file) return;
     const img = await uploadJewellery(file, "necklace", setNeckStatus, setNeckMsg);
-    if (img) { nBuf = []; setNecklace(img); }
+    if (img) { nState = null; setNecklace(img); }
   }, []);
 
   // ─── Capture & Download ─────────────────────────────────────────

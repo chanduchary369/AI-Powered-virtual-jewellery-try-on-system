@@ -216,26 +216,64 @@ def _split_two_contours(rgba: np.ndarray):
 def extract_earring(rgba: np.ndarray, pil_rgb: Image.Image) -> Tuple[np.ndarray, str]:
     """
     Extract single earring from any uploaded image.
-    Strategies tried in order: alpha-split → contour-split → largest contour.
+
+    Decides pair-vs-single up front by counting significant foreground
+    contours and inspecting the alpha-mask bounding box aspect:
+
+      • 1 significant contour AND a tall-ish bbox  → SINGLE EARRING.
+        Skip all pair-splitting (it would falsely "split" a single
+        earring at its narrow waist / chain neck and crop garbage).
+      • Otherwise → PAIR: try alpha-column split, then contour split.
     """
     H, W = rgba.shape[:2]
     alpha = rgba[:, :, 3]
     if alpha.max() < 15:
         raise JewelleryError("No earring detected. Use a clearer image.")
 
-    # Strategy 1: alpha column gap (works for merged-blob product photos)
-    sc = _alpha_column_split(alpha)
-    if sc is not None:
-        pad = max(int(W * 0.04), 12)
-        cut = min(sc + pad, W)
-        left_half = rgba[:, :cut].copy()
-        # Re-run BG removal on the cropped half for cleaner edges
-        left_pil = pil_rgb.crop((0, 0, cut, H))
-        rgba_clean = remove_background(left_pil)
-        cropped = _tight_crop(rgba_clean)
-        if cropped.shape[0] > 20 and cropped.shape[1] > 20:
-            print(f"[earring] alpha-split → {cropped.shape[1]}×{cropped.shape[0]}")
-            return cropped, "pair"
+    # ── Pre-scan: how many real foreground blobs do we have? ──────────
+    binary_pre = _clean_alpha_mask(alpha)
+    cnts_pre = _significant_contours(binary_pre, H * W)
+
+    # Overall bbox of all foreground pixels (whole jewellery footprint)
+    rows = np.any(alpha > 15, axis=1)
+    cols = np.any(alpha > 15, axis=0)
+    if rows.any() and cols.any():
+        r1, r2 = np.where(rows)[0][[0, -1]]
+        c1, c2 = np.where(cols)[0][[0, -1]]
+        bbox_w = max(1, c2 - c1)
+        bbox_h = max(1, r2 - r1)
+        bbox_aspect = bbox_w / bbox_h  # >1 = wider than tall
+    else:
+        bbox_aspect = 1.0
+
+    # Single-earring heuristic: exactly one significant blob AND the
+    # whole footprint is taller than wide (pairs are wider than tall
+    # because they sit side-by-side). Use largest contour directly.
+    if len(cnts_pre) == 1 and bbox_aspect < 1.30:
+        c = cnts_pre[0]
+        x, y, cw, ch = cv2.boundingRect(c)
+        if cw > 0 and cw / ch > 2.8:
+            raise JewelleryError(
+                "This looks like a necklace. Switch to Necklace mode."
+            )
+        print(f"[earring] single-contour direct → {cw}×{ch}")
+        return _crop_one_contour(rgba, c), "single"
+
+    # Strategy 1: alpha column gap (works for merged-blob product photos).
+    # Only attempt when the overall footprint is wider than tall — a true
+    # pair sits side-by-side, so its bbox is landscape-ish.
+    if bbox_aspect >= 1.10:
+        sc = _alpha_column_split(alpha)
+        if sc is not None:
+            pad = max(int(W * 0.04), 12)
+            cut = min(sc + pad, W)
+            # Re-run BG removal on the cropped half for cleaner edges
+            left_pil = pil_rgb.crop((0, 0, cut, H))
+            rgba_clean = remove_background(left_pil)
+            cropped = _tight_crop(rgba_clean)
+            if cropped.shape[0] > 20 and cropped.shape[1] > 20:
+                print(f"[earring] alpha-split → {cropped.shape[1]}×{cropped.shape[0]}")
+                return cropped, "pair"
 
     # Strategy 2: two clean contours
     result = _split_two_contours(rgba)
@@ -243,16 +281,15 @@ def extract_earring(rgba: np.ndarray, pil_rgb: Image.Image) -> Tuple[np.ndarray,
         print(f"[earring] two-contour split")
         return result, "pair"
 
-    # Strategy 3: single contour or single earring
-    binary = _clean_alpha_mask(alpha)
-    cnts = _significant_contours(binary, H * W)
-    if cnts:
-        x, y, cw, ch = cv2.boundingRect(cnts[0])
+    # Strategy 3: fall back to largest single contour
+    if cnts_pre:
+        x, y, cw, ch = cv2.boundingRect(cnts_pre[0])
         if cw > 0 and cw / ch > 2.8:
             raise JewelleryError(
                 "This looks like a necklace. Switch to Necklace mode."
             )
-        return _crop_one_contour(rgba, cnts[0]), "single"
+        print(f"[earring] fallback single-contour → {cw}×{ch}")
+        return _crop_one_contour(rgba, cnts_pre[0]), "single"
 
     return _tight_crop(rgba), "single"
 

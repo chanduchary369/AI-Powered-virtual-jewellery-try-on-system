@@ -227,6 +227,7 @@ body {
 .sg-slider {
   flex: 1;
   -webkit-appearance: none;
+  appearance: none;
   height: 4px;
   border-radius: 2px;
   background: linear-gradient(to right, var(--gold-400) 0%, var(--gold-400) 50%, var(--beige-300) 50%);
@@ -235,6 +236,16 @@ body {
 }
 .sg-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
+  appearance: none;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--gold-400);
+  border: 2px solid var(--beige-50);
+  box-shadow: 0 1px 6px rgba(0,0,0,.2);
+  cursor: pointer;
+  transition: transform .12s;
+}
+.sg-slider::-moz-range-thumb {
   width: 18px; height: 18px;
   border-radius: 50%;
   background: var(--gold-400);
@@ -244,6 +255,7 @@ body {
   transition: transform .12s;
 }
 .sg-slider::-webkit-slider-thumb:hover { transform: scale(1.15); }
+.sg-slider::-moz-range-thumb:hover { transform: scale(1.15); }
 
 /* ── Face shape & recommendations ──────────────────────── */
 .sg-shape-row { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 14px; }
@@ -322,10 +334,14 @@ body {
   position: absolute; inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 14px;
-  background: rgba(253,250,244,.84); backdrop-filter: blur(4px);
+  background: rgba(253,250,244,.84);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
 }
 .sg-overlay--hint {
-  background: transparent; backdrop-filter: none;
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
   pointer-events: none; justify-content: flex-end; padding-bottom: 24px;
 }
 .sg-overlay--hint p {
@@ -342,7 +358,9 @@ body {
 /* ── Modal ──────────────────────────────────────────────── */
 .sg-modal-backdrop {
   position: fixed; inset: 0;
-  background: rgba(20,16,10,.65); backdrop-filter: blur(6px);
+  background: rgba(20,16,10,.65);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
   z-index: 500; display: flex; align-items: center; justify-content: center; padding: 20px;
   animation: fadeIn .2s ease;
 }

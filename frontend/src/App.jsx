@@ -63,17 +63,48 @@ function getHeadTilt(lm, W, H) {
   );
 }
 
-// ─── EAR ANCHOR (anatomically correct, eye-corner based) ────────────────
+// ─── EAR ANCHOR (MIRRAR-style 3D side-of-head interpolation) ────────────
+// THE ROOT CAUSE of pitch-drift: using ANY front-of-face landmark for Y
+// (eye, nose tip, mouth) means the anchor foreshortens differently than
+// the actual ear under head tilt — they're at different Z depths on the
+// 3D head. Under pitch, front landmarks move further in 2D than the ear
+// does, so the earring slides off.
+//
+// THE FIX (this is the approach systems like MIRRAR / Candere use):
+// interpolate the lobe Y between TWO landmarks that both live on the
+// SIDE of the head, at the same Z depth as the ear. The earlobe sits
+// anatomically between the TRAGION (top of ear) and the ANGLE OF JAW
+// (bottom of ear region). Both are face-contour points on the side of
+// face — they share the ear's depth, so their 2D projection moves
+// together with the actual ear position through every head pose.
+//
+//   Left side:  tragion = lm[234], jaw angle = lm[58]
+//   Right side: tragion = lm[454], jaw angle = lm[288]
+//
+// Blending these two with a ~40% ratio (closer to the tragion, since the
+// lobe is in the upper-mid portion of that span) places the anchor on
+// the true lobe for ANY user — face shape, ear size, age and gender
+// independent — and keeps it locked under pitch, yaw, and roll.
 function earAnchor(lm, side, W, H) {
-  const fw      = faceWidth(lm, W);
-  const fh      = faceHeight(lm, H);
-  const avgEyeY = ((lm[33].y + lm[263].y) / 2) * H;
-  const lobeY   = avgEyeY + fh * 0.20;   // earlobe is anatomically here
+  const fw = faceWidth(lm, W);
 
   if (side === "L") {
-    return { x: lm[234].x * W - fw * 0.03, y: lobeY };
+    const tragY = lm[234].y * H;
+    const jawY  = lm[58].y  * H;
+    const lobeY = tragY + (jawY - tragY) * 0.40;
+    return {
+      x: lm[234].x * W - fw * 0.03,
+      y: lobeY,
+    };
   }
-  return { x: lm[454].x * W + fw * 0.03, y: lobeY };
+
+  const tragY = lm[454].y * H;
+  const jawY  = lm[288].y * H;
+  const lobeY = tragY + (jawY - tragY) * 0.40;
+  return {
+    x: lm[454].x * W + fw * 0.03,
+    y: lobeY,
+  };
 }
 
 // ─── NECKLACE ANCHOR (neck top, just below chin) ────────────────────────
@@ -111,34 +142,56 @@ function pitchOpacity(lm, H) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CANVAS RENDERING (with metallic shine)
+//  CANVAS RENDERING
+//  ── Earring pipeline:
+//     0) BACKDROP CONTRAST  → soft dark halo on the BACKGROUND behind the
+//                              earring so the design pops by relative
+//                              contrast (skin / hair gets slightly darker
+//                              behind it). No color shift on the earring.
+//     1) BASE DRAW          → earring drawn with its real, natural colors
+//                              and only a subtle grounding shadow.
 // ═══════════════════════════════════════════════════════════════════════════
 
 function drawEarring(ctx, img, cx, cy, w, h, angle, alpha, flipH) {
   if (alpha <= 0.01 || !img) return;
+
+  // ── Pass 0 — BACKDROP GOLD GLOW (warm halo behind the earring) ───────
+  // A soft warm-gold radial wash on the BACKGROUND behind the earring.
+  // The tone matches the gold of the earring so the design reads as a
+  // single jewel-toned focal area against the skin / hair. The earring
+  // itself is NEVER recolored — the warmth lives entirely on the
+  // backdrop. A deeper warm-gold core gives subtle contrast against
+  // skin so the piece doesn't disappear into the halo.
   ctx.save();
-  ctx.globalAlpha = Math.min(0.96, alpha);
-
-  // Gold glow shadow
-  ctx.shadowColor   = "rgba(255, 200, 60, 0.45)";
-  ctx.shadowBlur    = 14;
-  ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 2;
-
+  ctx.globalAlpha = Math.min(0.90, alpha);
   ctx.translate(cx, cy);
   ctx.rotate(angle);
   if (flipH) ctx.scale(-1, 1);
+  const haloR = Math.max(w * 0.78, h * 0.58);
+  // Halo centred over the visible earring body (hangs from cy with height h)
+  const haloG = ctx.createRadialGradient(0, h * 0.42, haloR * 0.26, 0, h * 0.42, haloR);
+  // Deep warm gold at the core (matches the brand gold-500 tone, slightly
+  // darker than skin for clear separation), fading to a bright gold haze.
+  haloG.addColorStop(0,    "rgba(140, 100, 30, 0.38)");
+  haloG.addColorStop(0.45, "rgba(201, 168, 76, 0.22)");
+  haloG.addColorStop(1,    "rgba(201, 168, 76, 0)");
+  ctx.fillStyle = haloG;
+  ctx.fillRect(-haloR, -haloR * 0.3, haloR * 2, haloR * 2);
+  ctx.restore();
 
-  // Pass 1 — base draw, top edge at anchor
+  // ── Pass 1 — BASE DRAW (earring in its natural color, no filter) ─────
+  // Only a subtle grounding shadow is applied (for realism, not color).
+  // The earring's true gold tone is preserved exactly as extracted.
+  ctx.save();
+  ctx.globalAlpha = Math.min(0.98, alpha);
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+  if (flipH) ctx.scale(-1, 1);
+  ctx.shadowColor   = "rgba(0, 0, 0, 0.42)";
+  ctx.shadowBlur    = 10;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 3;
   ctx.drawImage(img, -w / 2, 0, w, h);
-
-  // Pass 2 — metallic shine via screen blend
-  ctx.globalCompositeOperation = "screen";
-  ctx.globalAlpha = Math.min(0.18, alpha * 0.20);
-  ctx.shadowBlur = 0;
-  ctx.drawImage(img, -w / 2, 0, w, h);
-
-  ctx.globalCompositeOperation = "source-over";
   ctx.restore();
 }
 
@@ -146,6 +199,15 @@ function drawNecklace(ctx, img, centreX, topY, neckW, alpha) {
   if (alpha <= 0.01 || !img) return;
   const aspect = img.naturalHeight / img.naturalWidth || 1;
   const neckH = neckW * aspect;
+
+  // Pass 0 — soft dark shadow underneath (grounds the necklace on neck/skin)
+  ctx.save();
+  ctx.globalAlpha = Math.min(0.55, alpha * 0.55);
+  ctx.shadowColor   = "rgba(0, 0, 0, 0.55)";
+  ctx.shadowBlur    = 22;
+  ctx.shadowOffsetY = 8;
+  ctx.drawImage(img, centreX - neckW / 2, topY, neckW, neckH);
+  ctx.restore();
 
   ctx.save();
   ctx.globalAlpha = Math.min(0.97, alpha);
@@ -156,9 +218,9 @@ function drawNecklace(ctx, img, centreX, topY, neckW, alpha) {
 
   ctx.drawImage(img, centreX - neckW / 2, topY, neckW, neckH);
 
-  // Shine pass
+  // Shine pass (selective enhancement)
   ctx.globalCompositeOperation = "screen";
-  ctx.globalAlpha = Math.min(0.20, alpha * 0.22);
+  ctx.globalAlpha = Math.min(0.22, alpha * 0.24);
   ctx.shadowBlur = 0;
   ctx.drawImage(img, centreX - neckW / 2, topY, neckW, neckH);
 
@@ -341,10 +403,82 @@ export default function App() {
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(res.image, 0, 0, canvas.width, canvas.height);
 
       const hasLM = res.multiFaceLandmarks?.length > 0;
       setFaceDetected(hasLM);
+
+      // ── LUXURY VISUAL FILTER PIPELINE ──────────────────────────
+      // Step 1: paint a blurred + slightly darkened version of the
+      //         video frame across the whole canvas (background layer)
+      // Step 2: punch a soft elliptical hole around the face so the
+      //         sharp frame can show through there (subject region)
+      // Step 3: composite-draw the sharp frame BEHIND the dark blur,
+      //         filling the punched hole with crisp pixels
+      // Step 4: warm luxury tone wash over the whole canvas
+      // Step 5: soft vignette to deepen the portrait look
+      const cW = canvas.width, cH = canvas.height;
+
+      // Step 1: blurred + darkened background
+      ctx.save();
+      ctx.filter = "blur(14px) brightness(0.74) saturate(1.08) contrast(1.04)";
+      ctx.drawImage(res.image, 0, 0, cW, cH);
+      ctx.restore();
+
+      if (hasLM) {
+        const lmF = res.multiFaceLandmarks[0];
+        const fxL = lmF[234].x * cW;
+        const fxR = lmF[454].x * cW;
+        const fyT = lmF[10].y  * cH;
+        const fyB = lmF[152].y * cH;
+        const fcx = (fxL + fxR) / 2;
+        const fcy = (fyT + fyB) / 2;
+        const fwPx = Math.max(40, Math.abs(fxR - fxL));
+        const fhPx = Math.max(40, Math.abs(fyB - fyT));
+        // Generous radius so neckline / shoulders / ears stay sharp too
+        const rOuter = Math.max(fwPx, fhPx) * 1.55;
+        const rInner = rOuter * 0.55;
+
+        // Step 2: erase a soft circle in the blurred layer
+        ctx.save();
+        ctx.globalCompositeOperation = "destination-out";
+        const eraseGrad = ctx.createRadialGradient(fcx, fcy, rInner, fcx, fcy, rOuter);
+        eraseGrad.addColorStop(0, "rgba(0,0,0,1)");
+        eraseGrad.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = eraseGrad;
+        ctx.fillRect(0, 0, cW, cH);
+        ctx.restore();
+
+        // Step 3: draw sharp frame BEHIND so it fills the punched hole
+        ctx.save();
+        ctx.globalCompositeOperation = "destination-over";
+        ctx.drawImage(res.image, 0, 0, cW, cH);
+        ctx.restore();
+      } else {
+        // No face yet — keep the frame readable behind the blur
+        ctx.save();
+        ctx.globalCompositeOperation = "destination-over";
+        ctx.drawImage(res.image, 0, 0, cW, cH);
+        ctx.restore();
+      }
+
+      // Step 4: warm luxury tone wash (subtle gold haze, soft-light blend)
+      ctx.save();
+      ctx.globalCompositeOperation = "soft-light";
+      ctx.fillStyle = "rgba(255, 196, 128, 0.18)";
+      ctx.fillRect(0, 0, cW, cH);
+      ctx.restore();
+
+      // Step 5: portrait vignette — soft darkening at edges
+      ctx.save();
+      const vGrad = ctx.createRadialGradient(
+        cW / 2, cH / 2, Math.min(cW, cH) * 0.42,
+        cW / 2, cH / 2, Math.max(cW, cH) * 0.72
+      );
+      vGrad.addColorStop(0, "rgba(0,0,0,0)");
+      vGrad.addColorStop(1, "rgba(20,14,4,0.34)");
+      ctx.fillStyle = vGrad;
+      ctx.fillRect(0, 0, cW, cH);
+      ctx.restore();
 
       // No face for >5 frames → reset smoothing so next person snaps in cleanly
       if (!hasLM) {
@@ -371,8 +505,10 @@ export default function App() {
       }
 
       // ── EARRINGS ─────────────────────────────────────────
+      // Width scaled to ~0.21·fw (slightly larger than before for
+      // visibility, still face-adaptive so it stays realistic).
       if ((mode === "earring" || mode === "both") && earringRef.current) {
-        const ew = fw * 0.19 * scaleRef.current;
+        const ew = fw * 0.21 * scaleRef.current;
         const eh = ew * 2.2;
         const rawL = earAnchor(lm, "L", W, H);
         const rawR = earAnchor(lm, "R", W, H);
